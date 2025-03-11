@@ -24,12 +24,10 @@ import (
 
 type dispatchSuite struct {
 	testing.BaseSuite
-
 	server     *httptest.Server
 	serverAddr string
-
-	dead   chan error
-	unique int64
+	dead       chan error
+	unique     int64
 }
 
 var _ = gc.Suite(&dispatchSuite{})
@@ -38,33 +36,38 @@ func (s *dispatchSuite) SetUpTest(c *gc.C) {
 	s.BaseSuite.SetUpTest(c)
 
 	loggo.GetLogger("juju.rpc").SetLogLevel(loggo.TRACE)
+	s.dead = make(chan error, 1)
 
-	s.dead = make(chan error)
+	unique := atomic.AddInt64(&s.unique, 1)
+	mux := http.NewServeMux()
 
-	rpcServer := func(ws *websocket.Conn) {
-		codec := jsoncodec.NewWebsocket(ws)
+	mux.Handle(fmt.Sprintf("/rpc%d", unique), http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		c, err := websocketUpgrader.Upgrade(w, req, nil)
+		if err != nil {
+			c.Fatalf("failed to upgrade websocket: %v", err)
+			return
+		}
+		defer c.Close()
+
+		codec := jsoncodec.NewWebsocket(c)
 		conn := rpc.NewConn(codec, nil)
-
 		conn.Serve(&DispatchRoot{}, nil, nil)
 		conn.Start(context.Background())
 
 		select {
 		case <-conn.Dead():
 		case <-time.After(testing.LongWait):
-			c.Fatalf("timeout waiting for connection to be dead")
+			c.Fatalf("timeout waiting for connection to close")
 		}
+
 		select {
 		case s.dead <- conn.Close():
 		case <-time.After(testing.LongWait):
-			c.Fatalf("timeout waiting for connection to close")
+			c.Fatalf("timeout waiting for connection cleanup")
 		}
-	}
+	}))
 
-	unique := atomic.AddInt64(&s.unique, 1)
-
-	http.Handle(fmt.Sprintf("/rpc%d", unique), websocketHandler(rpcServer))
-
-	s.server = httptest.NewServer(nil)
+	s.server = httptest.NewServer(mux)
 	s.serverAddr = s.server.Listener.Addr().String()
 
 	s.AddCleanup(func(*gc.C) {
@@ -72,53 +75,47 @@ func (s *dispatchSuite) SetUpTest(c *gc.C) {
 	})
 }
 
-var wsUpgrader = &websocket.Upgrader{
-	CheckOrigin: func(*http.Request) bool {
-		return true
-	},
-}
-
-func websocketHandler(f func(*websocket.Conn)) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		c, err := wsUpgrader.Upgrade(w, req, nil)
-		if err == nil {
-			f(c)
-		}
-	})
+var websocketUpgrader = &websocket.Upgrader{
+	CheckOrigin: func(*http.Request) bool { return true },
 }
 
 func (s *dispatchSuite) TestWSWithoutParamsV0(c *gc.C) {
-	err := s.requestV0(c, `{"RequestId":1,"Type": "DispatchDummy","Id": "without","Request":"DoSomething"}`)
-	c.Assert(errors.Is(err, errors.NotSupported), jc.IsTrue)
+	s.assertRequestV0(c, `{"RequestId":1,"Type": "DispatchDummy","Id": "without","Request":"DoSomething"}`)
 }
 
 func (s *dispatchSuite) TestWSWithParamsV0(c *gc.C) {
-	err := s.requestV0(c, `{"RequestId":2,"Type": "DispatchDummy","Id": "with","Request":"DoSomething", "Params": {}}`)
-	c.Assert(errors.Is(err, errors.NotSupported), jc.IsTrue)
+	s.assertRequestV0(c, `{"RequestId":2,"Type": "DispatchDummy","Id": "with","Request":"DoSomething", "Params": {}}`)
 }
 
 func (s *dispatchSuite) TestWSWithoutParamsV1(c *gc.C) {
-	resp := s.requestV1(c, `{"request-id":1,"type": "DispatchDummy","id": "without","request":"DoSomething"}`)
-	s.assertResponse(c, resp, `{"request-id":1,"response":{}}`)
+	s.assertRequestV1(c, `{"request-id":1,"type": "DispatchDummy","id": "without","request":"DoSomething"}`, `{"request-id":1,"response":{}}`)
 }
 
 func (s *dispatchSuite) TestWSWithParamsV1(c *gc.C) {
-	resp := s.requestV1(c, `{"request-id":2,"type": "DispatchDummy","id": "with","request":"DoSomething", "params": {}}`)
-	s.assertResponse(c, resp, `{"request-id":2,"response":{}}`)
+	s.assertRequestV1(c, `{"request-id":2,"type": "DispatchDummy","id": "with","request":"DoSomething", "params": {}}`, `{"request-id":2,"response":{}}`)
 }
 
 func (s *dispatchSuite) TestWSWithParamsV1Tracing(c *gc.C) {
-	resp := s.requestV1(c, `{"request-id":2,"type": "DispatchDummy","id": "with","request":"DoSomething", "params": {}, "trace-id": "foobar", "span-id": "baz", "trace-flags": 1}`)
-	s.assertResponse(c, resp, `{"request-id":2,"response":{},"trace-id":"foobar","span-id":"baz","trace-flags":1}`)
+	s.assertRequestV1(c,
+		`{"request-id":2,"type": "DispatchDummy","id": "with","request":"DoSomething", "params": {}, "trace-id": "foobar", "span-id": "baz", "trace-flags": 1}`,
+		`{"request-id":2,"response":{},"trace-id":"foobar","span-id":"baz","trace-flags":1}`,
+	)
 }
 
-func (s *dispatchSuite) assertResponse(c *gc.C, obtained, expected string) {
-	c.Assert(obtained, gc.Equals, expected+"\n")
+func (s *dispatchSuite) assertRequestV0(c *gc.C, req string) {
+	err := s.sendRequestV0(c, req)
+	c.Assert(errors.Is(err, errors.NotSupported), jc.IsTrue)
 }
 
-// request performs one request to the test server via websockets.
-func (s *dispatchSuite) requestV0(c *gc.C, req string) error {
-	ws := s.request(c, req)
+func (s *dispatchSuite) assertRequestV1(c *gc.C, req, expected string) {
+	resp := s.sendRequestV1(c, req)
+	c.Assert(resp, gc.Equals, expected+"\n")
+}
+
+// sendRequestV0 sends a V0 request and waits for a response.
+func (s *dispatchSuite) sendRequestV0(c *gc.C, req string) error {
+	ws := s.openWebSocket(c, req)
+	defer ws.Close()
 
 	go func() {
 		_, _, err := ws.ReadMessage()
@@ -134,62 +131,19 @@ func (s *dispatchSuite) requestV0(c *gc.C, req string) error {
 	}
 }
 
-// request performs one request to the test server via websockets.
-func (s *dispatchSuite) requestV1(c *gc.C, req string) string {
-	ws := s.request(c, req)
+// sendRequestV1 sends a V1 request and waits for a response.
+func (s *dispatchSuite) sendRequestV1(c *gc.C, req string) string {
+	ws := s.openWebSocket(c, req)
+	defer ws.Close()
 
-	result := make(chan string)
+	result := make(chan string, 1)
 
 	go func() {
 		_, resp, err := ws.ReadMessage()
 		c.Check(err, jc.ErrorIsNil)
-
-		err = ws.Close()
-		c.Assert(err, jc.ErrorIsNil)
-
 		result <- string(resp)
 	}()
 
 	var resp string
 	select {
 	case resp = <-result:
-	case <-time.After(testing.LongWait):
-		c.Fatalf("timeout waiting for response")
-	}
-
-	// Wait for the server to close the connection, before returning.
-	select {
-	case err := <-s.dead:
-		c.Assert(err, jc.ErrorIsNil)
-	case <-time.After(testing.LongWait):
-		c.Fatalf("timeout waiting for response")
-	}
-
-	return resp
-}
-
-func (s *dispatchSuite) request(c *gc.C, req string) *websocket.Conn {
-	url := fmt.Sprintf("ws://%s/rpc%d", s.serverAddr, atomic.LoadInt64(&s.unique))
-	ws, _, err := websocket.DefaultDialer.Dial(url, http.Header{
-		"Origin": {"http://localhost"},
-	})
-	c.Assert(err, jc.ErrorIsNil)
-
-	reqData := []byte(req)
-	err = ws.WriteMessage(websocket.TextMessage, reqData)
-	c.Assert(err, jc.ErrorIsNil)
-
-	return ws
-}
-
-// DispatchRoot simulates the root for the test.
-type DispatchRoot struct{}
-
-func (*DispatchRoot) DispatchDummy(id string) (*DispatchDummy, error) {
-	return &DispatchDummy{}, nil
-}
-
-// DispatchDummy is the type to whish the request is dispatched.
-type DispatchDummy struct{}
-
-func (d *DispatchDummy) DoSomething() {}
